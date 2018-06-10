@@ -61,7 +61,7 @@ func MustMarshalJSON(x interface{}) []byte {
 // RoundTrip encodes to JSON, and decodes the result again.
 //
 // Thereby, it is converting its argument to the representation expected by
-// rego.Input and inmem's Write operations. Works with both references and
+// rego.ParsedInput and inmem's Write operations. Works with both references and
 // values.
 func RoundTrip(x *interface{}) error {
 	bs, err := json.Marshal(x)

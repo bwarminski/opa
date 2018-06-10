@@ -176,7 +176,7 @@ func ParsedImports(imp []*ast.Import) func(r *Rego) {
 	}
 }
 
-// Input returns an argument that sets the Rego input document. Input should be
+// ParsedInput returns an argument that sets the Rego input document. ParsedInput should be
 // a native Go value representing the input document.
 func Input(x interface{}) func(r *Rego) {
 	return func(r *Rego) {

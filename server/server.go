@@ -17,7 +17,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"crypto/tls"
@@ -37,10 +36,10 @@ import (
 	"github.com/open-policy-agent/opa/topdown"
 	"github.com/open-policy-agent/opa/util"
 	"github.com/open-policy-agent/opa/version"
-	"github.com/open-policy-agent/opa/watch"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/open-policy-agent/opa/server/controller"
 )
 
 // AuthenticationScheme enumerates the supported authentication schemes. The
@@ -84,16 +83,7 @@ type Server struct {
 	authentication    AuthenticationScheme
 	authorization     AuthorizationScheme
 	cert              *tls.Certificate
-	mtx               sync.RWMutex
-	partials          map[string]rego.PartialResult
-	store             storage.Store
-	manager           *plugins.Manager
-	watcher           *watch.Watcher
-	decisionIDFactory func() string
-	diagnostics       Buffer
-	revision          string
-	logger            func(context.Context, *Info)
-	errLimit          int
+	controller        *controller.Controller
 }
 
 type cachedCompiler struct {
@@ -107,7 +97,9 @@ type Loop func() error
 // New returns a new Server.
 func New() *Server {
 
-	s := Server{}
+	s := Server{
+		controller: controller.New(),
+	}
 
 	promRegistry := prometheus.NewRegistry()
 	duration := prometheus.NewHistogramVec(
@@ -183,7 +175,7 @@ func (s *Server) Init(ctx context.Context) (*Server, error) {
 	// so that the latter can run first.
 	switch s.authorization {
 	case AuthorizationBasic:
-		s.Handler = authorizer.NewBasic(s.Handler, s.getCompiler, s.store)
+		s.Handler = authorizer.NewBasic(s.Handler, s.controller.GetCompiler, s.controller.GetStore())
 	}
 
 	switch s.authentication {
@@ -191,31 +183,7 @@ func (s *Server) Init(ctx context.Context) (*Server, error) {
 		s.Handler = identifier.NewTokenBased(s.Handler)
 	}
 
-	txn, err := s.store.NewTransaction(ctx, storage.WriteParams)
-	if err != nil {
-		return nil, err
-	}
-
-	// Register triggers so that if runtime reloads the policies, the
-	// server sees the change.
-	config := storage.TriggerConfig{
-		OnCommit: s.reload,
-	}
-	if _, err := s.store.Register(ctx, txn, config); err != nil {
-		s.store.Abort(ctx, txn)
-		return nil, err
-	}
-
-	s.manager.RegisterCompilerTrigger(s.migrateWatcher)
-
-	s.watcher, err = watch.New(ctx, s.store, s.getCompiler(), txn)
-	if err != nil {
-		return nil, err
-	}
-
-	s.partials = map[string]rego.PartialResult{}
-
-	return s, s.store.Commit(ctx, txn)
+	return s, s.controller.Init(ctx)
 }
 
 // WithAddresses sets the listening addresses that the server will bind to.
@@ -250,38 +218,38 @@ func (s *Server) WithCertificate(cert *tls.Certificate) *Server {
 
 // WithStore sets the storage used by the server.
 func (s *Server) WithStore(store storage.Store) *Server {
-	s.store = store
+	s.controller = s.controller.WithStore(store)
 	return s
 }
 
 // WithManager sets the plugins manager used by the server.
 func (s *Server) WithManager(manager *plugins.Manager) *Server {
-	s.manager = manager
+	s.controller = s.controller.WithManager(manager)
 	return s
 }
 
 // WithCompilerErrorLimit sets the limit on the number of compiler errors the server will
 // allow.
 func (s *Server) WithCompilerErrorLimit(limit int) *Server {
-	s.errLimit = limit
+	s.controller = s.controller.WithCompilerErrorLimit(limit)
 	return s
 }
 
 // WithDiagnosticsBuffer sets the diagnostics buffer used by the server. DEPRECATED.
 func (s *Server) WithDiagnosticsBuffer(buf Buffer) *Server {
-	s.diagnostics = buf
+	s.controller = s.controller.WithDiagnosticsBuffer(buf)
 	return s
 }
 
 // WithDecisionLogger sets the decision logger used by the server.
 func (s *Server) WithDecisionLogger(logger func(context.Context, *Info)) *Server {
-	s.logger = logger
+	s.controller = s.controller.WithDecisionLogger(logger)
 	return s
 }
 
 // WithDecisionIDFactory sets a function on the server to generate decision IDs.
 func (s *Server) WithDecisionIDFactory(f func() string) *Server {
-	s.decisionIDFactory = f
+	s.controller = s.controller.WithDecisionIDFactory(f)
 	return s
 }
 
@@ -386,31 +354,24 @@ func (s *Server) execQuery(ctx context.Context, r *http.Request, query string, i
 		instrument = true
 	}
 
-	m := metrics.New()
+	output, err := s.controller.ExecQuery(ctx, controller.QueryRequest{
+		Query:       query,
+		ParsedInput: input,
+		Instrument:  instrument,
+		Tracer:      buf,
+	})
 
-	compiler := s.getCompiler()
-	rego := rego.New(
-		rego.Store(s.store),
-		rego.Compiler(compiler),
-		rego.Query(query),
-		rego.ParsedInput(input),
-		rego.Metrics(m),
-		rego.Instrument(instrument),
-		rego.Tracer(buf),
-	)
-
-	output, err := rego.Eval(ctx)
 	if err != nil {
-		diagLogger.Log(ctx, "", r.RemoteAddr, query, input, nil, err, m, buf)
+		diagLogger.Log(ctx, "", r.RemoteAddr, query, input, nil, err, output.Metrics, buf)
 		return results, err
 	}
 
-	for _, result := range output {
+	for _, result := range output.Results {
 		results.Result = append(results.Result, result.Bindings.WithoutWildcards())
 	}
 
 	if includeMetrics || includeInstrumentation {
-		results.Metrics = m.All()
+		results.Metrics = output.Metrics.All()
 	}
 
 	if explainMode != types.ExplainOffV1 {
@@ -418,7 +379,7 @@ func (s *Server) execQuery(ctx context.Context, r *http.Request, query string, i
 	}
 
 	var x interface{} = results.Result
-	diagLogger.Log(ctx, "", r.RemoteAddr, query, input, &x, nil, m, buf)
+	diagLogger.Log(ctx, "", r.RemoteAddr, query, input, &x, nil, output.Metrics, buf)
 	return results, nil
 }
 
@@ -469,36 +430,6 @@ func (s *Server) registerHandler(router *mux.Router, version int, path string, m
 	router.HandleFunc(prefix+path, h).Methods(method)
 }
 
-func (s *Server) reload(ctx context.Context, txn storage.Transaction, event storage.TriggerEvent) {
-
-	value, err := s.store.Read(ctx, txn, storage.MustParsePath("/system/bundle/manifest/revision"))
-	if err == nil {
-		revision, ok := value.(string)
-		if !ok {
-			panic("bad revision value")
-		}
-		s.revision = revision
-	} else if err != nil {
-		if !storage.IsNotFound(err) {
-			panic(err)
-		}
-	}
-
-	s.partials = map[string]rego.PartialResult{}
-}
-
-func (s *Server) migrateWatcher(txn storage.Transaction) {
-	var err error
-	s.watcher, err = s.watcher.Migrate(s.manager.GetCompiler(), txn)
-	if err != nil {
-		// The only way migration can fail is if the old watcher is closed or if
-		// the new one cannot register a trigger with the store. Since we're
-		// using an inmem store with a write transaction, neither of these should
-		// be possible.
-		panic(err)
-	}
-}
-
 func (s *Server) unversionedPost(w http.ResponseWriter, r *http.Request) {
 	s.v0QueryPath(w, r, systemMainPath)
 }
@@ -510,7 +441,7 @@ func (s *Server) v0DataPost(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) v0QueryPath(w http.ResponseWriter, r *http.Request, path ast.Ref) {
 	ctx := r.Context()
-	m := metrics.New()
+
 	diagLogger := s.evalDiagnosticPolicy(r)
 	input, err := readInputV0(r.Body)
 	if err != nil {
@@ -527,13 +458,13 @@ func (s *Server) v0QueryPath(w http.ResponseWriter, r *http.Request, path ast.Re
 	}
 
 	// Prepare for query.
-	txn, err := s.store.NewTransaction(ctx)
+	txn, err := s.controller.NewTransaction(ctx)
 	if err != nil {
 		writer.ErrorAuto(w, err)
 		return
 	}
 
-	defer s.store.Abort(ctx, txn)
+	defer s.controller.Abort(ctx, txn)
 
 	var buf *topdown.BufferTracer
 
@@ -541,38 +472,34 @@ func (s *Server) v0QueryPath(w http.ResponseWriter, r *http.Request, path ast.Re
 		buf = topdown.NewBufferTracer()
 	}
 
-	rego := rego.New(
-		rego.Compiler(s.getCompiler()),
-		rego.Store(s.store),
-		rego.Transaction(txn),
-		rego.Input(goInput),
-		rego.Query(path.String()),
-		rego.Metrics(m),
-		rego.Instrument(diagLogger.Instrument()),
-		rego.Tracer(buf),
-	)
-
-	rs, err := rego.Eval(ctx)
+	response, err := s.controller.ExecQuery(ctx, controller.QueryRequest{
+		Transaction: txn,
+		RawInput: goInput,
+		Query: path.String(),
+		Instrument: diagLogger.Instrument(),
+		Tracer: buf,
+	})
 
 	// Handle results.
 	if err != nil {
-		diagLogger.Log(ctx, "", r.RemoteAddr, path.String(), goInput, nil, err, m, buf)
+		diagLogger.Log(ctx, "", r.RemoteAddr, path.String(), goInput, nil, err, response.Metrics, buf)
 		writer.ErrorAuto(w, err)
 		return
 	}
 
-	if len(rs) == 0 {
+	if len(response.Results) == 0 {
 		writer.Error(w, 404, types.NewErrorV1(types.CodeUndefinedDocument, fmt.Sprintf("%v: %v", types.MsgUndefinedError, path)))
 		return
 	}
 
-	diagLogger.Log(ctx, "", r.RemoteAddr, path.String(), goInput, &rs[0].Expressions[0].Value, nil, m, buf)
-	writer.JSON(w, 200, rs[0].Expressions[0].Value, false)
+	diagLogger.Log(ctx, "", r.RemoteAddr, path.String(), goInput, &response.Results[0].Expressions[0].Value, nil, response.Metrics, buf)
+	writer.JSON(w, 200, response.Results[0].Expressions[0].Value, false)
 }
 
 func (s *Server) v1DiagnosticsGet(w http.ResponseWriter, r *http.Request) {
 	pretty := getBoolParam(r.URL, types.ParamPrettyV1, true)
-	if s.diagnostics == nil {
+	diagnostics :=  s.controller.GetDiagnostics()
+	if diagnostics == nil {
 		writer.ErrorAuto(w, fmt.Errorf(types.MsgDiagnosticsDisabled))
 		return
 	}
@@ -580,7 +507,7 @@ func (s *Server) v1DiagnosticsGet(w http.ResponseWriter, r *http.Request) {
 	resp := types.DiagnosticsResponseV1{
 		Result: []types.DiagnosticsResponseElementV1{},
 	}
-	s.diagnostics.Iter(func(i *Info) {
+	diagnostics.Iter(func(i *Info) {
 		item := types.DiagnosticsResponseElementV1{
 			Revision:   i.Revision,
 			DecisionID: i.DecisionID,
@@ -1275,60 +1202,6 @@ func (s *Server) watchQuery(query string, w http.ResponseWriter, r *http.Request
 	}
 }
 
-func (s *Server) evalDiagnosticPolicy(r *http.Request) (logger diagnosticsLogger) {
-
-	// XXX(tsandall): set the decision logger on the diagnostic logger. The
-	// diagnostic logger is called in all the necessary locations. The diagnostic
-	// logger will make sure to call the decision logger regardless of whether a
-	// diagnostic policy is configured. In the future, we can refactor this.
-	defer func() {
-		logger.revision = s.revision
-		logger.logger = s.logger
-	}()
-
-	if s.diagnostics == nil {
-		return diagnosticsLogger{}
-	}
-
-	input, err := makeDiagnosticsInput(r)
-	if err != nil {
-		return diagnosticsLogger{}
-	}
-
-	compiler := s.getCompiler()
-
-	rego := rego.New(
-		rego.Store(s.store),
-		rego.Compiler(compiler),
-		rego.Query(`data.system.diagnostics.config`),
-		rego.Input(input),
-	)
-
-	output, err := rego.Eval(r.Context())
-	if err != nil {
-		return diagnosticsLogger{}
-	}
-
-	if len(output) == 1 {
-		if config, ok := output[0].Expressions[0].Value.(map[string]interface{}); ok {
-			switch config["mode"] {
-			case "on":
-				return diagnosticsLogger{
-					buffer: s.diagnostics,
-				}
-			case "all":
-				return diagnosticsLogger{
-					buffer:     s.diagnostics,
-					instrument: true,
-					explain:    true,
-				}
-			}
-		}
-	}
-
-	return diagnosticsLogger{}
-}
-
 func (s *Server) getExplainResponse(explainMode types.ExplainModeV1, trace []*topdown.Event, pretty bool) (explanation types.TraceV1) {
 	switch explainMode {
 	case types.ExplainFullV1:
@@ -1374,10 +1247,6 @@ func (s *Server) loadModules(ctx context.Context, txn storage.Transaction) (map[
 	}
 
 	return modules, nil
-}
-
-func (s *Server) getCompiler() *ast.Compiler {
-	return s.manager.GetCompiler()
 }
 
 func (s *Server) makeRego(ctx context.Context, partial bool, txn storage.Transaction, input interface{}, path string, m metrics.Metrics, instrument bool, tracer topdown.Tracer, opts []func(*rego.Rego)) (*rego.Rego, error) {
@@ -1701,7 +1570,7 @@ func renderQueryForm(w http.ResponseWriter, qStrs []string, inputStrs []string, 
 	<form>
   	Query:<br>
 	<textarea rows="10" cols="50" name="q">%s</textarea><br>
-	<br>Input Data (JSON):<br>
+	<br>ParsedInput Data (JSON):<br>
 	<textarea rows="10" cols="50" name="input">%s</textarea><br>
 	<br><input type="submit" value="Submit"> Explain:
 	<input type="radio" name="explain" value="off" %v>Off
@@ -1732,50 +1601,7 @@ func renderVersion(w http.ResponseWriter) {
 	fmt.Fprintln(w, "<br>")
 }
 
-type diagnosticsLogger struct {
-	logger     func(context.Context, *Info)
-	revision   string
-	explain    bool
-	instrument bool
-	buffer     Buffer
-}
 
-func (l diagnosticsLogger) Explain() bool {
-	return l.explain
-}
-
-func (l diagnosticsLogger) Instrument() bool {
-	return l.instrument
-}
-
-func (l diagnosticsLogger) Log(ctx context.Context, decisionID, remoteAddr, query string, input interface{}, results *interface{}, err error, m metrics.Metrics, tracer *topdown.BufferTracer) {
-
-	info := &Info{
-		Revision:   l.revision,
-		Timestamp:  time.Now().UTC(),
-		DecisionID: decisionID,
-		RemoteAddr: remoteAddr,
-		Query:      query,
-		Input:      input,
-		Results:    results,
-		Error:      err,
-		Metrics:    m,
-	}
-
-	if tracer != nil {
-		info.Trace = *tracer
-	}
-
-	if l.logger != nil {
-		l.logger(ctx, info)
-	}
-
-	if l.buffer == nil {
-		return
-	}
-
-	l.buffer.Push(info)
-}
 
 type patchImpl struct {
 	path  storage.Path

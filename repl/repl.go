@@ -1317,7 +1317,7 @@ func printHelpCommands(output io.Writer) {
 
 func printHelpInput(output io.Writer) error {
 
-	printHelpTitle(output, "Input")
+	printHelpTitle(output, "ParsedInput")
 
 	txt := strings.TrimSpace(`
 Rego allows queries to refer to documents outside of the storage layer. These
