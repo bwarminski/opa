@@ -88,7 +88,7 @@ type Server struct {
 	partials          map[string]rego.PartialResult
 	store             storage.Store
 	manager           *plugins.Manager
-	watcher           *watch.Watcher
+	Watcher           *watch.Watcher
 	decisionIDFactory func() string
 	diagnostics       Buffer
 	revision          string
@@ -208,7 +208,7 @@ func (s *Server) Init(ctx context.Context) (*Server, error) {
 
 	s.manager.RegisterCompilerTrigger(s.migrateWatcher)
 
-	s.watcher, err = watch.New(ctx, s.store, s.getCompiler(), txn)
+	s.Watcher, err = watch.New(ctx, s.store, s.getCompiler(), txn)
 	if err != nil {
 		return nil, err
 	}
@@ -489,9 +489,9 @@ func (s *Server) reload(ctx context.Context, txn storage.Transaction, event stor
 
 func (s *Server) migrateWatcher(txn storage.Transaction) {
 	var err error
-	s.watcher, err = s.watcher.Migrate(s.manager.GetCompiler(), txn)
+	s.Watcher, err = s.Watcher.Migrate(s.manager.GetCompiler(), txn)
 	if err != nil {
-		// The only way migration can fail is if the old watcher is closed or if
+		// The only way migration can fail is if the old Watcher is closed or if
 		// the new one cannot register a trigger with the store. Since we're
 		// using an inmem store with a write transaction, neither of these should
 		// be possible.
@@ -667,20 +667,10 @@ func (s *Server) v1DataGet(w http.ResponseWriter, r *http.Request) {
 		instrument = true
 	}
 
-	rego := rego.New(
-		rego.Compiler(s.getCompiler()),
-		rego.Store(s.store),
-		rego.Transaction(txn),
-		rego.Input(goInput),
-		rego.Query(path.String()),
-		rego.Metrics(m),
-		rego.Tracer(buf),
-		rego.Instrument(instrument),
-	)
+	result := types.DataResponseV1{}
 
-	rs, err := rego.Eval(ctx)
+	result.Result, err = s.GetDocument(ctx, txn, m, buf, instrument, false, path, goInput)
 
-	// Handle results.
 	if err != nil {
 		diagLogger.Log(ctx, "", r.RemoteAddr, path.String(), goInput, nil, err, m, buf)
 		writer.ErrorAuto(w, err)
@@ -688,16 +678,13 @@ func (s *Server) v1DataGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	decisionID := s.generateDecisionID()
-
-	result := types.DataResponseV1{
-		DecisionID: decisionID,
-	}
+	result.DecisionID = decisionID
 
 	if includeMetrics || includeInstrumentation {
 		result.Metrics = m.All()
 	}
 
-	if len(rs) == 0 {
+	if result.Result == nil {
 		if explainMode == types.ExplainFullV1 {
 			result.Explanation, err = types.NewTraceV1(*buf, pretty)
 			if err != nil {
@@ -709,14 +696,71 @@ func (s *Server) v1DataGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result.Result = &rs[0].Expressions[0].Value
-
 	if explainMode != types.ExplainOffV1 {
 		result.Explanation = s.getExplainResponse(explainMode, *buf, pretty)
 	}
 
 	diagLogger.Log(ctx, decisionID, r.RemoteAddr, path.String(), goInput, result.Result, nil, m, buf)
 	writer.JSON(w, 200, result, pretty)
+}
+
+func (s *Server) GetDocument(ctx context.Context, txn storage.Transaction, m metrics.Metrics, buf topdown.Tracer, instrument bool, allowPartial bool, path ast.Ref, goInput interface{}) (*interface{}, error) {
+	var r *rego.Rego
+	if allowPartial {
+		s.mtx.Lock()
+		defer s.mtx.Unlock()
+		pr, ok := s.partials[path.String()]
+		if !ok {
+			r = rego.New(
+				rego.Compiler(s.getCompiler()),
+				rego.Store(s.store),
+				rego.Transaction(txn),
+				rego.Input(goInput),
+				rego.Query(path.String()),
+				rego.Metrics(m),
+				rego.Tracer(buf),
+				rego.Instrument(instrument),
+			)
+
+			var err error
+			pr, err = r.PartialEval(ctx)
+			if err != nil {
+				return nil, err
+			}
+			s.partials[path.String()] = pr
+		}
+		opts := []func(*rego.Rego){
+			rego.Input(goInput),
+			rego.Transaction(txn),
+			rego.Metrics(m),
+			rego.Instrument(instrument),
+			rego.Tracer(buf),
+		}
+		r = pr.Rego(opts...)
+	} else {
+		r = rego.New(
+			rego.Compiler(s.getCompiler()),
+			rego.Store(s.store),
+			rego.Transaction(txn),
+			rego.Input(goInput),
+			rego.Query(path.String()),
+			rego.Metrics(m),
+			rego.Tracer(buf),
+			rego.Instrument(instrument),
+		)
+	}
+
+	rs, err := r.Eval(ctx)
+	// Handle results.
+	if err != nil {
+		return nil, err
+	}
+
+	if len(rs) == 0 {
+		return nil, nil
+	}
+
+	return &rs[0].Expressions[0].Value, nil
 }
 
 func (s *Server) v1DataPatch(w http.ResponseWriter, r *http.Request) {
@@ -742,11 +786,11 @@ func (s *Server) v1DataPatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	for _, patch := range patches {
-		if err := s.store.Write(ctx, txn, patch.op, patch.path, patch.value); err != nil {
-			s.abortAuto(ctx, txn, w, err)
-			return
-		}
+	err = s.UpdateDocument(ctx, txn, patches)
+
+	if err != nil {
+		s.abortAuto(ctx, txn, w, err)
+		return
 	}
 
 	if err := s.store.Commit(ctx, txn); err != nil {
@@ -754,6 +798,16 @@ func (s *Server) v1DataPatch(w http.ResponseWriter, r *http.Request) {
 	} else {
 		writer.Bytes(w, 204, nil)
 	}
+}
+
+func (s *Server) UpdateDocument(ctx context.Context, txn storage.Transaction, patches []PatchTriple) error {
+	for _, patch := range patches {
+		if err := s.store.Write(ctx, txn, patch.op, patch.path, patch.value); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (s *Server) v1DataPost(w http.ResponseWriter, r *http.Request) {
@@ -802,11 +856,6 @@ func (s *Server) v1DataPost(w http.ResponseWriter, r *http.Request) {
 
 	defer s.store.Abort(ctx, txn)
 
-	opts := []func(*rego.Rego){
-		rego.Compiler(s.getCompiler()),
-		rego.Store(s.store),
-	}
-
 	var buf *topdown.BufferTracer
 
 	if explainMode != types.ExplainOffV1 || diagLogger.Explain() {
@@ -819,7 +868,9 @@ func (s *Server) v1DataPost(w http.ResponseWriter, r *http.Request) {
 		instrument = true
 	}
 
-	rego, err := s.makeRego(ctx, partial, txn, goInput, path.String(), m, instrument, buf, opts)
+	result := types.DataResponseV1{}
+
+	result.Result, err = s.GetDocument(ctx, txn, m, buf, instrument, partial, path, goInput)
 
 	if err != nil {
 		diagLogger.Log(ctx, "", r.RemoteAddr, path.String(), goInput, nil, err, m, nil)
@@ -827,26 +878,15 @@ func (s *Server) v1DataPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rs, err := rego.Eval(ctx)
-
-	// Handle results.
-	if err != nil {
-		diagLogger.Log(ctx, "", r.RemoteAddr, path.String(), goInput, nil, err, m, buf)
-		writer.ErrorAuto(w, err)
-		return
-	}
-
 	decisionID := s.generateDecisionID()
 
-	result := types.DataResponseV1{
-		DecisionID: decisionID,
-	}
+	result.DecisionID = decisionID
 
 	if includeMetrics || includeInstrumentation {
 		result.Metrics = m.All()
 	}
 
-	if len(rs) == 0 {
+	if result.Result == nil {
 		if explainMode == types.ExplainFullV1 {
 			result.Explanation, err = types.NewTraceV1(*buf, pretty)
 			if err != nil {
@@ -857,8 +897,6 @@ func (s *Server) v1DataPost(w http.ResponseWriter, r *http.Request) {
 		writer.JSON(w, 200, result, pretty)
 		return
 	}
-
-	result.Result = &rs[0].Expressions[0].Value
 
 	if explainMode != types.ExplainOffV1 {
 		result.Explanation = s.getExplainResponse(explainMode, *buf, pretty)
@@ -890,25 +928,15 @@ func (s *Server) v1DataPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = s.store.Read(ctx, txn, path)
-
+	dontOverwrite := r.Header.Get("If-None-Match") == "*"
+	err = s.InsertDocument(ctx, txn, path, value, dontOverwrite)
 	if err != nil {
-		if !storage.IsNotFound(err) {
+		if IsEntryExistsError(err) && dontOverwrite {
+			s.store.Abort(ctx, txn)
+			writer.Bytes(w, 304, nil)
+		} else {
 			s.abortAuto(ctx, txn, w, err)
-			return
 		}
-		if err := storage.MakeDir(ctx, s.store, txn, path[:len(path)-1]); err != nil {
-			s.abortAuto(ctx, txn, w, err)
-			return
-		}
-	} else if r.Header.Get("If-None-Match") == "*" {
-		s.store.Abort(ctx, txn)
-		writer.Bytes(w, 304, nil)
-		return
-	}
-
-	if err := s.store.Write(ctx, txn, storage.AddOp, path, value); err != nil {
-		s.abortAuto(ctx, txn, w, err)
 		return
 	}
 
@@ -917,6 +945,25 @@ func (s *Server) v1DataPut(w http.ResponseWriter, r *http.Request) {
 	} else {
 		writer.Bytes(w, 204, nil)
 	}
+}
+
+func (s *Server) InsertDocument(ctx context.Context, txn storage.Transaction, path storage.Path, value interface{}, dontOverwrite bool) error {
+	_, err := s.store.Read(ctx, txn, path)
+	if err != nil {
+		if !storage.IsNotFound(err) {
+			return err
+		}
+		if err := storage.MakeDir(ctx, s.store, txn, path[:len(path)-1]); err != nil {
+			return err
+		}
+	} else if dontOverwrite {
+		return &Error{
+			Code: EntryExistsErr,
+			Message: "Entry exists and overwrite forbidden",
+		}
+	}
+
+	return s.store.Write(ctx, txn, storage.AddOp, path, value)
 }
 
 func (s *Server) v1DataDelete(w http.ResponseWriter, r *http.Request) {
@@ -935,13 +982,9 @@ func (s *Server) v1DataDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = s.store.Read(ctx, txn, path)
-	if err != nil {
-		s.abortAuto(ctx, txn, w, err)
-		return
-	}
+	err = s.DeleteDocument(ctx, txn, path)
 
-	if err := s.store.Write(ctx, txn, storage.RemoveOp, path, nil); err != nil {
+	if err != nil {
 		s.abortAuto(ctx, txn, w, err)
 		return
 	}
@@ -951,6 +994,16 @@ func (s *Server) v1DataDelete(w http.ResponseWriter, r *http.Request) {
 	} else {
 		writer.Bytes(w, 204, nil)
 	}
+}
+
+func (s *Server) DeleteDocument(ctx context.Context, txn storage.Transaction, path storage.Path) error {
+	_, err := s.store.Read(ctx, txn, path)
+
+	if err != nil {
+		return err
+	}
+
+	return s.store.Write(ctx, txn, storage.RemoveOp, path, nil)
 }
 
 func (s *Server) v1PoliciesDelete(w http.ResponseWriter, r *http.Request) {
@@ -967,30 +1020,19 @@ func (s *Server) v1PoliciesDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	modules, err := s.loadModules(ctx, txn)
+	err = s.DeletePolicy(ctx, txn, m, id)
 
 	if err != nil {
-		s.abortAuto(ctx, txn, w, err)
-		return
-	}
+		switch err := err.(type) {
+		case *CompileError:
+			s.abort(ctx, txn, func() {
+				writer.Error(w, http.StatusBadRequest, types.NewErrorV1(types.CodeInvalidOperation, types.MsgCompileModuleError).WithASTErrors(err.Errors))
+			})
 
-	delete(modules, id)
+		default:
+			s.abortAuto(ctx, txn, w, err)
+		}
 
-	c := ast.NewCompiler().SetErrorLimit(s.errLimit)
-
-	m.Timer(metrics.RegoModuleCompile).Start()
-
-	if c.Compile(modules); c.Failed() {
-		s.abort(ctx, txn, func() {
-			writer.Error(w, http.StatusBadRequest, types.NewErrorV1(types.CodeInvalidOperation, types.MsgCompileModuleError).WithASTErrors(c.Errors))
-		})
-		return
-	}
-
-	m.Timer(metrics.RegoModuleCompile).Stop()
-
-	if err := s.store.DeletePolicy(ctx, txn, id); err != nil {
-		s.abortAuto(ctx, txn, w, err)
 		return
 	}
 
@@ -1007,6 +1049,23 @@ func (s *Server) v1PoliciesDelete(w http.ResponseWriter, r *http.Request) {
 	writer.JSON(w, http.StatusOK, response, pretty)
 }
 
+func (s *Server) DeletePolicy(ctx context.Context, txn storage.Transaction, m metrics.Metrics, id string) (error) {
+	modules, err := s.loadModules(ctx, txn)
+
+	if err != nil {
+		return err
+	}
+
+	delete(modules, id)
+
+	err = s.CompileModules(ctx, txn, m, modules)
+	if err != nil {
+		return err
+	}
+
+	return s.store.DeletePolicy(ctx, txn, id)
+}
+
 func (s *Server) v1PoliciesGet(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	vars := mux.Vars(r)
@@ -1021,23 +1080,30 @@ func (s *Server) v1PoliciesGet(w http.ResponseWriter, r *http.Request) {
 
 	defer s.store.Abort(ctx, txn)
 
-	bs, err := s.store.GetPolicy(ctx, txn, path)
+	response, err := s.GetPolicy(ctx, txn, path)
 	if err != nil {
 		writer.ErrorAuto(w, err)
 		return
 	}
 
-	c := s.getCompiler()
+	writer.JSON(w, http.StatusOK, response, pretty)
+}
 
-	response := types.PolicyGetResponseV1{
-		Result: types.PolicyV1{
-			ID:  path,
-			Raw: string(bs),
-			AST: c.Modules[path],
-		},
+func (s *Server) GetPolicy(ctx context.Context, txn storage.Transaction, path string) (types.PolicyGetResponseV1, error) {
+	bs, err := s.store.GetPolicy(ctx, txn, path)
+	response := types.PolicyGetResponseV1{}
+	if err != nil {
+		return response, err
 	}
 
-	writer.JSON(w, http.StatusOK, response, pretty)
+	c := s.getCompiler()
+
+	response.Result = types.PolicyV1{
+		ID:  path,
+		Raw: string(bs),
+		AST: c.Modules[path],
+	}
+	return response, nil
 }
 
 func (s *Server) v1PoliciesList(w http.ResponseWriter, r *http.Request) {
@@ -1053,14 +1119,24 @@ func (s *Server) v1PoliciesList(w http.ResponseWriter, r *http.Request) {
 
 	defer s.store.Abort(ctx, txn)
 
+	response, err := s.ListPolicies(ctx, txn)
+	if err != nil {
+		writer.ErrorAuto(w, err)
+		return
+	}
+
+	writer.JSON(w, http.StatusOK, response, pretty)
+}
+
+func (s *Server) ListPolicies(ctx context.Context, txn storage.Transaction) (types.PolicyListResponseV1, error) {
 	policies := []types.PolicyV1{}
 	c := s.getCompiler()
+	response := types.PolicyListResponseV1{}
 
 	for id, mod := range c.Modules {
 		bs, err := s.store.GetPolicy(ctx, txn, id)
 		if err != nil {
-			writer.ErrorAuto(w, err)
-			return
+			return response, err
 		}
 		policy := types.PolicyV1{
 			ID:  id,
@@ -1070,11 +1146,8 @@ func (s *Server) v1PoliciesList(w http.ResponseWriter, r *http.Request) {
 		policies = append(policies, policy)
 	}
 
-	response := types.PolicyListResponseV1{
-		Result: policies,
-	}
-
-	writer.JSON(w, http.StatusOK, response, pretty)
+	response.Result = policies
+	return response, nil
 }
 
 func (s *Server) v1PoliciesPut(w http.ResponseWriter, r *http.Request) {
@@ -1094,62 +1167,27 @@ func (s *Server) v1PoliciesPut(w http.ResponseWriter, r *http.Request) {
 	}
 
 	m.Timer("server_read_bytes").Stop()
-	m.Timer(metrics.RegoModuleParse).Start()
 
-	parsedMod, err := ast.ParseModule(path, string(buf))
-
-	m.Timer(metrics.RegoModuleParse).Stop()
+	err = s.UpdatePolicy(ctx, nil, m, path, buf)
 
 	if err != nil {
 		switch err := err.(type) {
 		case ast.Errors:
 			writer.Error(w, http.StatusBadRequest, types.NewErrorV1(types.CodeInvalidParameter, types.MsgCompileModuleError).WithASTErrors(err))
+		case *CompileError:
+			writer.Error(w, http.StatusBadRequest, types.NewErrorV1(types.CodeInvalidParameter, types.MsgCompileModuleError).WithASTErrors(err.Errors))
+		case *WrappedError:
+			switch nested := err.Nested.(type) {
+			case ast.Errors:
+				writer.Error(w, http.StatusBadRequest, types.NewErrorV1(types.CodeInvalidParameter, types.MsgCompileModuleError).WithASTErrors(nested))
+			case *CompileError:
+				writer.Error(w, http.StatusBadRequest, types.NewErrorV1(types.CodeInvalidParameter, types.MsgCompileModuleError).WithASTErrors(nested.Errors))
+			default:
+				writer.ErrorAuto(w, err.Nested)
+			}
 		default:
-			writer.ErrorString(w, http.StatusBadRequest, types.CodeInvalidParameter, err)
+			writer.ErrorAuto(w, err)
 		}
-		return
-	}
-
-	if parsedMod == nil {
-		writer.Error(w, http.StatusBadRequest, types.NewErrorV1(types.CodeInvalidParameter, "empty module"))
-		return
-	}
-
-	txn, err := s.store.NewTransaction(ctx, storage.WriteParams)
-
-	if err != nil {
-		writer.ErrorAuto(w, err)
-		return
-	}
-
-	modules, err := s.loadModules(ctx, txn)
-	if err != nil {
-		s.abortAuto(ctx, txn, w, err)
-		return
-	}
-
-	modules[path] = parsedMod
-
-	c := ast.NewCompiler().SetErrorLimit(s.errLimit)
-
-	m.Timer(metrics.RegoModuleCompile).Start()
-
-	if c.Compile(modules); c.Failed() {
-		s.abort(ctx, txn, func() {
-			writer.Error(w, http.StatusBadRequest, types.NewErrorV1(types.CodeInvalidParameter, types.MsgCompileModuleError).WithASTErrors(c.Errors))
-		})
-		return
-	}
-
-	m.Timer(metrics.RegoModuleCompile).Stop()
-
-	if err := s.store.UpsertPolicy(ctx, txn, path, buf); err != nil {
-		s.abortAuto(ctx, txn, w, err)
-		return
-	}
-
-	if err := s.store.Commit(ctx, txn); err != nil {
-		writer.ErrorAuto(w, err)
 		return
 	}
 
@@ -1160,6 +1198,93 @@ func (s *Server) v1PoliciesPut(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writer.JSON(w, http.StatusOK, response, pretty)
+}
+
+func (s *Server) UpdatePolicy(ctx context.Context, outer storage.Transaction, m metrics.Metrics, path string, body []byte) (error) {
+	m.Timer(metrics.RegoModuleParse).Start()
+
+	parsedMod, err := ast.ParseModule(path, string(body))
+
+	m.Timer(metrics.RegoModuleParse).Stop()
+	if err != nil {
+		return NewWrappedError(ModuleParseErr, err)
+	}
+
+	if parsedMod == nil {
+		return NewWrappedError(ModuleParseErr, errors.New("empty module"))
+	}
+
+	var txn storage.Transaction
+	if outer != nil {
+		txn = outer
+	} else {
+		txn, err = s.store.NewTransaction(ctx, storage.WriteParams)
+	}
+
+	if err != nil {
+		return err
+	}
+
+	err = s.CompileModule(ctx, txn, m, path, parsedMod)
+	if err != nil {
+		if outer == nil {
+			s.store.Abort(ctx, txn)
+		}
+		return err
+	}
+
+	if err := s.store.UpsertPolicy(ctx, txn, path, body); err != nil {
+		if outer == nil {
+			s.store.Abort(ctx, txn)
+		}
+		return err
+	}
+
+	if outer == nil  {
+		if err != nil {
+			s.store.Abort(ctx, txn)
+		} else {
+			err = s.store.Commit(ctx, txn)
+		}
+	}
+	return err
+}
+
+func (s *Server) CompileModule(ctx context.Context, txn storage.Transaction, m metrics.Metrics, path string, parsedMod *ast.Module) (error) {
+
+	var err error
+
+	if err != nil {
+		return err
+	}
+
+	modules, err := s.loadModules(ctx, txn)
+	if err != nil {
+		return err
+	}
+
+	modules[path] = parsedMod
+
+	return s.CompileModules(ctx, txn, m, modules)
+}
+
+func (s *Server) CompileModules(ctx context.Context, txn storage.Transaction, m metrics.Metrics, modules map[string]*ast.Module) (error) {
+	var err error
+
+	if err != nil {
+		return err
+	}
+
+	c := ast.NewCompiler().SetErrorLimit(s.errLimit)
+
+	m.Timer(metrics.RegoModuleCompile).Start()
+
+	if c.Compile(modules); c.Failed() {
+		return NewCompileError(c.Errors)
+	}
+
+	m.Timer(metrics.RegoModuleCompile).Stop()
+	return nil
 }
 
 func (s *Server) v1QueryGet(w http.ResponseWriter, r *http.Request) {
@@ -1204,7 +1329,7 @@ func (s *Server) watchQuery(query string, w http.ResponseWriter, r *http.Request
 	includeMetrics := getBoolParam(r.URL, types.ParamMetricsV1, true)
 	includeInstrumentation := getBoolParam(r.URL, types.ParamInstrumentV1, true)
 
-	watch := s.watcher.NewQuery(query).WithInstrumentation(includeInstrumentation)
+	watch := s.Watcher.NewQuery(query).WithInstrumentation(includeInstrumentation)
 	err := watch.Start()
 
 	if err != nil {
@@ -1410,13 +1535,13 @@ func (s *Server) makeRego(ctx context.Context, partial bool, txn storage.Transac
 	return rego.New(opts...), nil
 }
 
-func (s *Server) prepareV1PatchSlice(root string, ops []types.PatchV1) (result []patchImpl, err error) {
+func (s *Server) prepareV1PatchSlice(root string, ops []types.PatchV1) (result []PatchTriple, err error) {
 
 	root = "/" + strings.Trim(root, "/")
 
 	for _, op := range ops {
 
-		impl := patchImpl{
+		impl := PatchTriple{
 			value: op.Value,
 		}
 
@@ -1732,6 +1857,12 @@ func renderVersion(w http.ResponseWriter) {
 	fmt.Fprintln(w, "<br>")
 }
 
+type DiagnosticsLogger interface {
+	Explain() bool
+	Instument() bool
+	Log(ctx context.Context, decisionID, remoteAddr, query string, input interface{}, results *interface{}, err error, m metrics.Metrics, tracer *topdown.BufferTracer)
+}
+
 type diagnosticsLogger struct {
 	logger     func(context.Context, *Info)
 	revision   string
@@ -1777,7 +1908,7 @@ func (l diagnosticsLogger) Log(ctx context.Context, decisionID, remoteAddr, quer
 	l.buffer.Push(info)
 }
 
-type patchImpl struct {
+type PatchTriple struct {
 	path  storage.Path
 	op    storage.PatchOp
 	value interface{}
